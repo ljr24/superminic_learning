@@ -50,3 +50,19 @@ git pull --ff-only origin main
 ```
 
 Do not update code during a running experiment. Models, datasets and experiment outputs are managed separately from Git. Never commit proxy credentials or private keys.
+
+## Verified on 2026-11-02
+
+- PyTorch 2.11.0+cu130 on A100-SXM4-80GB: GPU operations and compiled backward passed.
+- 40 LAFAN1 clips (441,140 resampled frames, 2.45 hours), 38 G1 meshes, MJCF and USD conversion completed.
+- `tools/test_env.py`: 64 environments, 150 open-loop steps completed; FK position max error 6.45e-7 m. This is an infrastructure check, not a trained-policy tracking score.
+- EGL/FFmpeg export: `results/verification_reference.mp4`, 3 seconds, 960x540, 75 frames. Reference motion only, not a trained policy.
+- No training run was started. Container initially exposes physical GPU 0; choose an available GPU before training.
+
+To recheck compiler and rendering:
+
+```bash
+docker exec supermimic python deployment/verify_runtime.py
+docker exec supermimic python deployment/verify_render.py
+docker exec supermimic python tools/render.py results/verification_reference.npz results/verification_reference.mp4 --seconds 3 --title "REFERENCE ONLY - environment check"
+```

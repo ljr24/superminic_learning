@@ -20,3 +20,4 @@ results/analysis/
 # server deployment state
 deployment/logs/
 deployment/status.txt
+/work/
