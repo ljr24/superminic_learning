@@ -16,3 +16,7 @@ logs/
 results/analysis/
 # third-party paper
 *.pdf
+
+# server deployment state
+deployment/logs/
+deployment/status.txt
