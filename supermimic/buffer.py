@@ -6,6 +6,8 @@ import torch
 
 from .dimensions import STATE_DIM, XI_DIM
 
+# 每条记录是一条真实仿真转移；a是含探索噪声的实际动作，f是参考帧索引。
+# done包含物理终止、超时及动作片段结束。
 FIELDS = {
     "s": (STATE_DIM, torch.float32),
     "s1": (STATE_DIM, torch.float32),
@@ -19,6 +21,7 @@ FIELDS = {
 }
 
 
+# GPU数据布局(T,N,...)：每环境T步、并行环境N个；写满后覆盖最旧数据。
 class ReplayBuffer:
     def __init__(self, T: int, N: int, device: str):
         self.T, self.N, self.device = T, N, device
@@ -38,6 +41,8 @@ class ReplayBuffer:
         """Map age-ordered time index (0 = oldest) to the storage row."""
         return (self.ptr - self.size + age) % self.T
 
+    # 模型训练入口：默认B=2048、k=8；每窗固定一个环境，时间连续。
+    # s/s1形状(B,k,71)，a形状(B,k,29)，xi形状(B,k,33)。
     def sample_windows(self, B: int, k: int):
         """k-step windows; returns dict of (B, k, ...) tensors and a validity mask (B, k)."""
         if k < 1 or k > self.size:
@@ -50,10 +55,14 @@ class ReplayBuffer:
         out = {key: self.data[key][rows, e] for key in ("s", "s1", "a", "xi", "done")}
         # transition j is valid if no episode ended at transitions 0..j-1
         d = out["done"].float()
+        # 终止转移本身有效，只屏蔽之后的转移，避免把重置跳变当动力学。
+        # 例如done=[0,1,0,0]得到mask=[1,1,0,0]。
         mask = torch.cumprod(torch.cat((torch.ones(B, 1, device=self.device), 1 - d[:, :-1]), -1), -1)
         out["mask"] = mask
         return out
 
+    # 策略训练入口：抽起点及重建观测历史所需的数据。
+    # 历史不足时重复最早可用帧，不能跨回合读取历史。
     def sample_starts(self, B: int, hist: int):
         """Start points for imagination plus the indices of their observation history (oldest first)."""
         age = torch.randint(0, self.size, (B,), device=self.device)

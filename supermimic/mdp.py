@@ -51,15 +51,20 @@ class RewardCfg:
     term_tilt: float = 0.8
 
 
+# 回放存储71维：p3 + 四元数4 + v3 + w3 + q29 + qd29。
+# 这与invariant_features()的71维不同：存储仍保留完整位置和朝向。
 def flatten_state(S) -> torch.Tensor:
     p, R, v, w, q, qd = S
     return torch.cat((p, mat_to_quat(R), v, w, q, qd), -1)
 
 
+# 从紧凑存储格式还原(p,R,v,w,q,qd)，旋转恢复为3×3矩阵。
 def unflatten_state(x: torch.Tensor):
     return x[..., 0:3], quat_to_mat(x[..., 3:7]), x[..., 7:10], x[..., 10:13], x[..., 13:42], x[..., 42:71]
 
 
+# 世界模型状态特征71维：高度1 + 去水平朝向的姿态6 + 局部速度3+3 + 关节29+29。
+# 去掉绝对水平位置/朝向以共享动力学；高度和身体倾斜仍然保留。
 def invariant_features(S) -> torch.Tensor:
     """Heading- and position-invariant state features: height, tilt (6D), body-frame velocities, joints."""
     p, R, v, w, q, qd = S
@@ -92,6 +97,7 @@ class MDP:
         self.obs_scale = OBS_SCALE.to(dev)
 
     # ---------------- observation ----------------
+    # 从完整状态解析构造策略观测；本仓库额外加入6维参考相对根部姿态。
     def obs(self, S, a_prev, xi, f) -> torch.Tensor:
         """Noise-free proprioceptive observation (+ reference-relative root orientation)."""
         p, R, v, w, q, qd = S
@@ -105,6 +111,8 @@ class MDP:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
 
     # ---------------- reward / termination ----------------
+    # PyTorch运动学+解析奖励：梯度能从身体跟踪误差回到预测状态。
+    # 无单独学习的奖励头，因此模型损失也没有奖励头监督项。
     def reward(self, S, f, a, a_prev, terms: bool = False):
         """Per-step reward (already multiplied by dt) comparing S with reference frame f."""
         c, m = self.cfg, self.motion
@@ -151,6 +159,8 @@ class MDP:
         e_tilt = (rR[..., 2, 2] - R[..., 2, 2]).abs()
         return (e_z > self.cfg.term_height) | (e_tilt > self.cfg.term_tilt)
 
+    # 仿真采集用termination()硬阈值；想象训练用sigmoid平滑近似以保持可微。
+    # 这是解析软终止权重，不是用标签训练出来的概率网络。
     def soft_termination(self, S, f, tz: float = 0.02, tt: float = 0.04) -> torch.Tensor:
         """Differentiable termination probability for imagined rollouts."""
         p, R = S[0], S[1]
@@ -180,5 +190,6 @@ class MDP:
 CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
 
 
+# xi顺序：摩擦系数1、关节校准偏移29、躯干质心偏移3；缩放不同量纲。
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:
     return torch.cat(((xi[..., :1] - 0.75) / 0.45, xi[..., 1:30] / 0.01, xi[..., 30:33] / 0.05), -1)

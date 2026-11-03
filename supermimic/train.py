@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+# 【阅读导航】
+# 1. networks.WorldModel：单步预测；mdp：状态、观测、解析奖励。
+# 2. collect -> env.step -> buffer.add：采集真实仿真监督。
+# 3. wm_update -> _wm_rollout -> _wm_err：8步自回归拟合，论文式(1)。
+# 4. policy_update -> _imag_step：固定模型、32步想象及BPTT，式(2)(3)。
+# 5. 文件底部主循环串联上述阶段；初读可跳过日志、保存和性能分析。
+# 本注释对应第三方实现；以下默认值可由命令行覆盖。
 import argparse
 import json
 import math
@@ -92,6 +99,8 @@ ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.ful
                        torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
 
 
+# 输入为(B,k,71)/(B,k,29)/(B,k,33)，默认k=8。
+# 只在起点使用真实状态，之后持续输入自己的预测；动作始终使用回放记录。
 def _wm_rollout(s, a, xi):
     S = unflatten_state(s[:, 0])
     preds = []
@@ -101,13 +110,18 @@ def _wm_rollout(s, a, xi):
     return tuple(torch.stack([P[i] for P in preds], 1) for i in range(6))  # (B, k, ...)
 
 
+# 归一化70维状态误差；ERR_FLOOR避免标准差过小时放大误差。
 def _wm_err(S_hat, s1, mask):
     std = torch.maximum(wm.out_norm.std(), ERR_FLOOR)
     e = (wm.state_error(S_hat, unflatten_state(s1)) / std) ** 2  # (B, k, D)
     e = e.mean(-1)
+    # 对有效时间步求和、对批量取平均，没有除以有效时间步总数。
+    # 最后一项是第8步监控误差；wm_update()返回时除以k仅用于日志。
     return (e * mask).sum() / s1.shape[0], e[:, -1]
 
 
+# 一个想象步：策略动作 -> 模型下一状态 -> 带噪观测及下一目标。
+# 不调用真实仿真器，且保留整条计算图；f是参考帧索引。
 def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
     a = pi(o_hist, g)
     S1 = wm.step(S, a, xi_n)
@@ -117,6 +131,7 @@ def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
     return S1, a, o_hist, f1, motion.goal(f1, K)
 
 
+# 使用解析奖励和平滑终止条件，没有额外学习的奖励/终止网络。
 def _reward_term(S, f, a, a_prev):
     return mdp.reward(S, f, a, a_prev), mdp.soft_termination(S, f)
 
@@ -125,6 +140,7 @@ def _critic_input(S, f, xi_n, g):
     return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
 
 
+# torch.compile用于加速；算法本身仍由上面的下划线函数定义。
 wm_rollout = torch.compile(_wm_rollout)
 wm_err = torch.compile(_wm_err)
 imag_step = torch.compile(_imag_step)
@@ -144,6 +160,8 @@ def set_requires_grad(m: nn.Module, flag: bool):
 
 
 # ------------------------------------------------------------------------------------------------
+# 【模型学习】监督来自真实仿真；只更新wm参数。
+# 默认每次抽2048个8步窗口，主循环每轮调用10次。
 def wm_update():
     w = buffer.sample_windows(args.wm_batch, args.wm_window)
     S_hat = wm_rollout(w["s"], w["a"], w["xi"])
@@ -156,6 +174,7 @@ def wm_update():
     return loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1)
 
 
+# 想象起点之后必须剩下足够的参考帧，避免HZ步展开越过动作片段结尾。
 def sample_valid_starts(B: int):
     starts, hists, n = [], [], 0
     while n < B:
@@ -172,6 +191,7 @@ def sample_valid_starts(B: int):
 PROFILE = bool(int(os.environ.get("SM_PROFILE", "0")))
 
 
+# 【策略学习】从回放起点展开默认32步，动作由当前策略产生，而非回放动作。
 def policy_update():
     if PROFILE:
         torch.cuda.synchronize(); tq0 = time.time()
@@ -182,6 +202,8 @@ def policy_update():
     with torch.no_grad():
         o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
     o_hist = mdp.add_noise(o_hist)
+    # 冻结模型/Critic权重，但保留它们对输入的导数。
+    # 不能用torch.no_grad()包住想象循环，否则策略BPTT路径会断开。
     set_requires_grad(wm, False)
     set_requires_grad(critic, False)
     B = args.pi_batch
@@ -189,15 +211,18 @@ def policy_update():
     g = g0
     S0 = S
     Ss, As, Aps, Fs, Gs = [], [], [], [], []
+    # 保留全部预测状态和动作的计算图，稍后统一计算奖励、反向传播。
     for t in range(HZ):
         Aps.append(a_prev)
         S, a_prev, o_hist, f, g = imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
         Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
+    # 展平时间和批量，批量计算奖励，再恢复为(HZ,B)。
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
     f_all = flat(Fs)
     r, d = reward_term(S_all, f_all, flat(As), flat(Aps))
     r, d = r.view(HZ, B), d.view(HZ, B)
+    # d是动作后的软终止；c_t是动作前累计生存权重，保持可微。
     alive = torch.cumprod(1 - d, 0)  # c_{t+1}
     c_t = torch.cat((torch.ones(1, B, device=dev), alive[:-1]), 0)
     disc = args.gamma ** torch.arange(HZ, device=dev, dtype=torch.float32).unsqueeze(-1)
@@ -207,9 +232,11 @@ def policy_update():
     rews, dones = r.detach(), d.detach()
     if not args.no_critic:
         J = J + (args.gamma**HZ) * c * critic(_critic_input(S, f, xi_n, g))
+    # J = 窗口内折扣奖励 + 末端价值估计；最小化负回报即最大化预测回报。
     loss = -J.mean()
     if PROFILE:
         torch.cuda.synchronize(); tq1 = time.time()
+    # 梯度路径：回报 -> 预测状态 -> 模型对动作/状态的导数 -> 策略参数。
     opt_pi.zero_grad(set_to_none=True)
     loss.backward()
     if PROFILE:
@@ -218,12 +245,14 @@ def policy_update():
     nn.utils.clip_grad_value_(pi.parameters(), 0.1)
     if torch.isfinite(gn):
         opt_pi.step()
+    # 恢复参数求导，供后续模型更新和本轮Critic更新使用。
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
     # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
     v_loss = torch.zeros(())
     if not args.no_critic:
         with torch.no_grad():
+            # Critic用想象轨迹学习，但先断开轨迹梯度，不再次更新策略或模型。
             S_c = tuple(torch.cat((S0[i].unsqueeze(0), torch.stack([St[i].detach() for St in Ss])), 0).flatten(0, 1) for i in range(6))
             f_c = torch.cat((s["f"].unsqueeze(0), torch.stack(Fs)), 0).flatten()
             g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
@@ -232,6 +261,7 @@ def policy_update():
         critic.norm.update(X)
         with torch.no_grad():
             V = critic(X)
+            # 从末端价值往前递推lambda-return；监督目标固定后再拟合Critic。
             R = V[-1]
             targets = []
             for t in range(HZ - 1, -1, -1):
@@ -263,6 +293,7 @@ with launch_simulation(sim_cfg, args):
     buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev)
     obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 
+    # 真实仿真采集不做BPTT；模型监督在后续wm_update()中使用。
     @torch.no_grad()
     def collect(n_steps: int, stats: dict):
         global obs_hist, sim_steps
@@ -276,9 +307,11 @@ with launch_simulation(sim_cfg, args):
             pi.goal_norm.update(g)
             a = pi(obs_hist, g)
             a = torch.clamp(a + args.action_noise * torch.randn_like(a), -20, 20)
+            # 保存加噪后实际执行的动作，否则模型输入与仿真结果不对应。
             out = env.step(a)
             buffer.add(out)
             S0, S1 = unflatten_state(out["s"]), unflatten_state(out["s1"])
+            # 这里只更新归一化统计，不训练模型参数。targets()提供真实增量的统计样本。
             wm.in_norm.update(wm.inputs(S0, out["a"], normalize_xi(out["xi"])))
             wm.out_norm.update(wm.targets(S0, S1))
             sim_steps += args.num_envs
@@ -299,11 +332,13 @@ with launch_simulation(sim_cfg, args):
     t_log = time.time()
     step_acc = 0.0
     agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
+    # 【总入口】采集 -> 10次模型更新 -> 1次策略/Critic更新；前500轮暂不更新策略。
     for it in range(start_it, args.iterations):
         lr = lr_at(it)
         for o in (opt_wm, opt_pi, opt_v):
             for gparam in o.param_groups:
                 gparam["lr"] = lr
+        # 默认UTD=0.4：每轮平均采集2.5个并行仿真步，实际在2/3步之间交替。
         step_acc += 1.0 / args.utd
         n = int(step_acc)
         step_acc -= n

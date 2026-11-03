@@ -118,6 +118,7 @@ class TrackingSim:
         self.sim.backend_manager.add_model_change(ModelFlags.SHAPE_PROPERTIES)
 
     # ------------------------------------------------------------------ state
+    # 读取仿真器完整监督状态；与策略可见的mdp.obs()不同。
     def state(self):
         d = self.robot.data
         pose = d.root_link_pose_w.torch.clone()
@@ -189,17 +190,20 @@ class TrackingSim:
         self.scene.update(0.0)
 
     # ------------------------------------------------------------------ step
+    # 【模型数据来源】记录动作前后真实状态，奖励/终止标签也由仿真状态计算。
     def step(self, a: torch.Tensor) -> dict:
         S = self.state()
         f = self.f.clone()
         xi = self.xi.clone()
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
+        # a是归一化设定值，经缩放、校准偏移和PD控制器作用于机器人。
         target = self.default_q + xi[:, 1:30] + self.alpha * a
         self.robot.set_joint_position_target_index(target=target)
         self.scene.write_data_to_sim()
         self.sim.step(render=False)
         self.scene.update(CONTROL_DT)
+        # 必须在回合重置之前记录S1，保证(s,a,s1)是一条真实物理转移。
         S1 = self.state()
         f1 = f + 1
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
